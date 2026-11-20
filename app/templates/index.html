@@ -49,6 +49,43 @@
 </section>
 
 <section class="panel">
+  <div class="row-split">
+    <h2>命名空间残留扫描</h2>
+    <span class="muted small">命名空间卡在 Terminating 时，扫描其中还没清掉的资源。</span>
+  </div>
+  <form method="post" action="/ns-scan" class="actions">
+    <input type="text" name="namespace" placeholder="命名空间名称" required>
+    <button class="primary" type="submit">扫描残留</button>
+  </form>
+  {% if scans %}
+    <table style="margin-top:14px">
+      <thead>
+        <tr><th>命名空间</th><th>结果</th><th>开始时间</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for scan in scans[:8] %}
+          <tr>
+            <td class="mono">{{ scan.namespace }}</td>
+            <td class="small">
+              {% if scan.void %}
+                <span class="badge danger">已作废</span>
+              {% elif scan.all_clear %}
+                <span class="badge ok">本次未发现残留</span>
+              {% else %}
+                <span class="badge warn">残留 {{ scan.total }}</span>
+                {% if not scan.fully_scanned %}<span class="badge danger">未查全</span>{% endif %}
+              {% endif %}
+            </td>
+            <td class="small muted mono">{{ scan.started_at }}</td>
+            <td><a href="/ns-scan/{{ scan.scan_id }}">详情</a></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</section>
+
+<section class="panel">
   <h2>排空轮次</h2>
   {% if rounds %}
     <table>

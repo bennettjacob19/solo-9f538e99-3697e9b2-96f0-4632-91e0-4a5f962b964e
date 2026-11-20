@@ -11,6 +11,7 @@ import uvicorn
 
 from app.drain import DrainManager
 from app.kube import KubeClient
+from app.nsscan import ScanManager
 
 
 def _free_port() -> int:
@@ -51,6 +52,13 @@ def kube(simulator_url):
 @pytest.fixture()
 def manager(kube):
     return DrainManager(kube)
+
+
+@pytest.fixture()
+def scanner(kube):
+    # Small pages so pagination and continue-token handling are exercised
+    # against the handful of seeded objects.
+    return ScanManager(kube, page_size=3)
 
 
 @pytest.fixture()

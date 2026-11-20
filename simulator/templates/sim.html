@@ -57,6 +57,60 @@
     </section>
 
     <section class="panel">
+      <h2>命名空间</h2>
+      <table>
+        <thead><tr><th>名称</th><th>相位</th><th>UID</th><th>finalizers</th><th>操作</th></tr></thead>
+        <tbody id="namespaces"></tbody>
+      </table>
+      <p class="hint">“同名重建”会以新 UID 重建命名空间并清空其中对象；用于演练扫描作废。</p>
+    </section>
+
+    <section class="panel">
+      <h2>扫描演练预设</h2>
+      <div id="drills" class="hint" style="margin-bottom:8px"></div>
+      <div class="row">
+        <select id="vanish-target">
+          <option value="|pods">core / pods</option>
+          <option value="|configmaps">core / configmaps</option>
+          <option value="|secrets">core / secrets</option>
+          <option value="policy|poddisruptionbudgets">policy / poddisruptionbudgets</option>
+          <option value="workloads.example.io|rollouts">workloads.example.io / rollouts</option>
+          <option value="workloads.example.io|experiments">workloads.example.io / experiments</option>
+        </select>
+        <button onclick="armVanish()">预设：第一页后移除对象并让续页过期</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <select id="fail-group">
+          <option value="policy">policy</option>
+          <option value="workloads.example.io">workloads.example.io</option>
+        </select>
+        <button onclick="act('/api/sim/drills/discovery-failure', {group: document.getElementById('fail-group').value})">预设：该 API 组发现失败</button>
+        <button onclick="act('/api/sim/drills/clear', {})">清除全部预设</button>
+      </div>
+      <p class="hint">两个预设都作用于值班台的“命名空间残留扫描”（输入 stuck-ns 体验）。第一个为一次性，触发后自动解除。</p>
+    </section>
+
+    <section class="panel">
+      <h2>残留对象（通用类型）</h2>
+      <table>
+        <thead><tr><th>类型</th><th>对象</th><th>finalizers</th></tr></thead>
+        <tbody id="objects"></tbody>
+      </table>
+      <div class="row" style="margin-top:8px">
+        <select id="obj-type">
+          <option value="|configmaps">core / configmaps</option>
+          <option value="|secrets">core / secrets</option>
+          <option value="workloads.example.io|rollouts">workloads.example.io / rollouts</option>
+          <option value="workloads.example.io|experiments">workloads.example.io / experiments</option>
+        </select>
+        <input id="obj-ns" placeholder="命名空间" value="stuck-ns" style="width:110px">
+        <input id="obj-name" placeholder="名称" style="width:140px">
+        <input id="obj-finalizers" placeholder="finalizers（逗号分隔）" style="width:180px">
+        <button onclick="addObject()">添加残留对象</button>
+      </div>
+    </section>
+
+    <section class="panel">
       <h2>Pod</h2>
       <table>
         <thead><tr><th>Pod</th><th>节点</th><th>归属</th><th>状态</th><th>同名替换 / 操作</th></tr></thead>
@@ -104,6 +158,31 @@ async function load() {
       <td>${n.ready ? badge('Ready','ok') : badge('NotReady','danger')}</td>
     </tr>`).join('');
 
+  document.getElementById('namespaces').innerHTML = state.namespaces.map(ns => `
+    <tr>
+      <td class="mono">${ns.name}</td>
+      <td>${ns.phase === 'Terminating' ? badge('Terminating','warn') : badge(ns.phase,'ok')}</td>
+      <td class="mono hint">${ns.uid.slice(0,8)}</td>
+      <td class="mono hint">${(ns.finalizers || []).join(', ') || '—'}</td>
+      <td><div class="row">
+        <button onclick="if(confirm('删除命名空间 ${ns.name}？')) act('/api/sim/namespaces/${ns.name}/remove', {})">删除</button>
+        <button onclick="if(confirm('以同名新 UID 重建 ${ns.name}？其中对象会被清空。')) act('/api/sim/namespaces/${ns.name}/recreate', {})">同名重建</button>
+      </div></td>
+    </tr>`).join('');
+
+  document.getElementById('objects').innerHTML = state.objects.map(o => `
+    <tr>
+      <td class="mono">${(o.group || 'core')}/${o.resource} <span class="hint">${o.kind}</span></td>
+      <td class="mono">${o.namespace}/${o.name}</td>
+      <td class="mono hint">${(o.finalizers || []).join(', ') || '—'}</td>
+    </tr>`).join('') || '<tr><td colspan="3" class="hint">无</td></tr>';
+
+  const d = state.drills;
+  const bits = [];
+  if (d.vanish_after_first_page) bits.push(`已预设：${d.vanish_after_first_page.group || 'core'}/${d.vanish_after_first_page.resource} 第一页后移除并过期（一次性）`);
+  if (d.failing_groups && d.failing_groups.length) bits.push(`发现失败的 API 组：${d.failing_groups.join(', ')}`);
+  document.getElementById('drills').textContent = bits.length ? bits.join('；') : '当前没有生效的扫描演练预设。';
+
   document.getElementById('pods').innerHTML = state.pods.map(p => {
     const owner = p.static ? badge('静态 Pod','info') : (p.owner_kind || badge('独立',''));
     const st = p.terminating ? badge('退出中','warn') : (p.healthy ? badge('运行中','ok') : badge('未就绪','danger'));
@@ -150,6 +229,23 @@ async function updateBudget(id) {
   const mode = document.getElementById('mode-' + id).value;
   const value = parseInt(document.getElementById('budget-' + id).value, 10);
   await act('/api/sim/budgets/' + id, {[mode]: value});
+}
+
+async function armVanish() {
+  const [group, resource] = document.getElementById('vanish-target').value.split('|');
+  await act('/api/sim/drills/vanish-after-first-page', {group, resource});
+}
+
+async function addObject() {
+  const [group, resource] = document.getElementById('obj-type').value.split('|');
+  const finalizers = document.getElementById('obj-finalizers').value
+    .split(',').map(s => s.trim()).filter(s => s);
+  await act('/api/sim/objects', {
+    group, resource,
+    namespace: document.getElementById('obj-ns').value.trim(),
+    name: document.getElementById('obj-name').value.trim(),
+    finalizers,
+  });
 }
 
 load();

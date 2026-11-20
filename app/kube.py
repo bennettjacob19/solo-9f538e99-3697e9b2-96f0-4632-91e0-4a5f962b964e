@@ -24,11 +24,17 @@ from pathlib import Path
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
-from .models import NodeInfo, Pod, PodBudget
+from .models import NamespaceInfo, NodeInfo, Pod, PodBudget
 
 
 class KubeError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+class KubeGone(KubeError):
+    """HTTP 410: the paginated list's continue token expired mid-scan."""
 
 
 class EvictionBlocked(Exception):
@@ -305,6 +311,63 @@ class KubeClient:
             return self.policy.list_pod_disruption_budget_for_all_namespaces().items
         except ApiException as exc:
             raise KubeError(f"读取 PDB 失败: {exc.status} {exc.reason}") from exc
+
+    # -- generic access (discovery + dynamic lists) -------------------------
+    def get_json(self, path: str, params: list[tuple[str, object]] | None = None) -> dict:
+        """Raw GET against the API server, returning the decoded JSON object.
+
+        Used for API discovery and for listing dynamically discovered
+        resources, neither of which has a generated method.  Auth, TLS and
+        error handling are identical to the typed calls.  A 410 response
+        raises :class:`KubeGone` so callers can restart a paginated list.
+        """
+        query = [(key, str(value)) for key, value in (params or [])]
+        request = self._api.param_serialize(
+            method="GET",
+            resource_path=path,
+            query_params=query,
+            header_params={"Accept": "application/json"},
+            auth_settings=["BearerToken"],
+        )
+        try:
+            response = self._api.call_api(*request)
+            response.read()
+            if not 200 <= response.status <= 299:
+                raise ApiException.from_response(
+                    http_resp=response, body=response.data, data=None
+                )
+            return json.loads(response.data)
+        except ApiException as exc:
+            if exc.status == 410:
+                raise KubeGone(
+                    f"GET {path} 返回 410：{_status_message(exc)}", status=410
+                ) from exc
+            if exc.status:
+                raise KubeError(
+                    f"GET {path} 失败: {exc.status} {_status_message(exc)}",
+                    status=exc.status,
+                ) from exc
+            raise KubeError(f"GET {path} 失败: {exc.reason}") from exc
+
+    def get_namespace(self, name: str) -> NamespaceInfo | None:
+        try:
+            ns = self.core.read_namespace(name)
+        except ApiException as exc:
+            if exc.status == 404:
+                return None
+            raise KubeError(
+                f"读取命名空间 {name} 失败: {exc.status} {exc.reason}",
+                status=exc.status,
+            ) from exc
+        meta = ns.metadata
+        deleted = meta.deletion_timestamp
+        return NamespaceInfo(
+            name=meta.name,
+            uid=meta.uid,
+            phase=(ns.status.phase or "") if ns.status else "",
+            deletion_timestamp=deleted.isoformat() if deleted else None,
+            finalizers=list(meta.finalizers or []),
+        )
 
     # -- writes ------------------------------------------------------------
     def cordon(self, node: str) -> None:

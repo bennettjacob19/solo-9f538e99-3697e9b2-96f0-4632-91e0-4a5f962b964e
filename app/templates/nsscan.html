@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+{% block content %}
+{% if report is none %}
+  <section class="panel">
+    {% if error %}
+      <div class="alert error"><strong>无法连接集群：</strong>{{ error }}</div>
+    {% endif %}
+    <h2>无法显示扫描结果</h2>
+    <p class="muted">
+      {% if error %}
+        请检查集群连接配置，然后重试。
+      {% else %}
+        扫描记录 <span class="mono">{{ scan_id }}</span> 不存在（可能已被清理）。
+      {% endif %}
+    </p>
+    <a class="button" href="/">返回首页</a>
+  </section>
+{% else %}
+  {% if error %}
+    <div class="alert error"><strong>操作失败：</strong>{{ error }}</div>
+  {% endif %}
+
+  <section class="panel">
+    <div class="row-split">
+      <h2 class="mono">{{ report.namespace }}</h2>
+      {% if report.phase == 'Terminating' %}
+        <span class="badge warn">Terminating</span>
+      {% else %}
+        <span class="badge neutral">{{ report.phase or '未知相位' }}</span>
+      {% endif %}
+    </div>
+    <p class="small muted">
+      扫描 <span class="mono">{{ report.scan_id }}</span> ·
+      命名空间 UID <span class="mono">{{ report.namespace_uid[:8] }}</span> ·
+      开始 {{ report.started_at }} · 完成 {{ report.finished_at }}
+    </p>
+
+    {% if report.void %}
+      <div class="alert danger"><strong>本次扫描作废。</strong>{{ report.void_reason }}请重新扫描。</div>
+    {% elif report.all_clear %}
+      <div class="alert ok">
+        <strong>本次未发现残留。</strong>所有支持 list 的命名空间资源均已查全，计数为零。
+      </div>
+    {% else %}
+      {% if not report.fully_scanned %}
+        <div class="alert warn">
+          <strong>部分范围未查全。</strong>下列缺口中的资源可能仍有残留；已查全的结果保留在下方。
+        </div>
+      {% endif %}
+      {% if report.total > 0 %}
+        <div class="alert warn">已查全范围内共发现 <strong>{{ report.total }}</strong> 个残留对象。</div>
+      {% endif %}
+    {% endif %}
+
+    <div class="actions">
+      <form method="post" action="/ns-scan">
+        <input type="hidden" name="namespace" value="{{ report.namespace }}">
+        <button class="primary" type="submit">重新扫描</button>
+      </form>
+      <a class="button ghost" href="/">返回首页</a>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="grid">
+      <div class="stat {{ 'warn' if report.total else '' }}"><div class="num">{{ report.total }}</div><div class="cap">残留对象（已查全范围）</div></div>
+      <div class="stat"><div class="num">{{ report.types|length }}</div><div class="cap">资源类型</div></div>
+      <div class="stat {{ 'danger' if report.incomplete_types else '' }}"><div class="num">{{ report.incomplete_types|length }}</div><div class="cap">未查全类型</div></div>
+      <div class="stat {{ 'danger' if report.gaps else '' }}"><div class="num">{{ report.gaps|length }}</div><div class="cap">发现缺口</div></div>
+    </div>
+    <p class="small muted" style="margin:14px 0 0">
+      统计口径：API 发现中支持 list 的命名空间资源（子资源除外）；同组同一资源只查首选版本。
+      分页扫描，内存占用只随单页大小与资源类型数增长。
+    </p>
+  </section>
+
+  {% if report.gaps %}
+    <section class="panel">
+      <h3>未查全的 API 组（发现失败）</h3>
+      <table>
+        <thead><tr><th>范围</th><th>错误</th></tr></thead>
+        <tbody>
+          {% for gap in report.gaps %}
+            <tr>
+              <td class="mono">{{ gap.scope }}</td>
+              <td class="small">{{ gap.error }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+  {% endif %}
+
+  <section class="panel">
+    <h3>按类型统计</h3>
+    {% if report.types %}
+      <table>
+        <thead>
+          <tr><th>资源类型</th><th>数量</th><th>状态</th><th>带 finalizer 的对象（最多 5 个）</th></tr>
+        </thead>
+        <tbody>
+          {% for t in report.types %}
+            <tr>
+              <td class="mono">{{ t.ref.display }}<div class="small muted">{{ t.ref.kind }}</div></td>
+              <td>
+                {% if t.complete %}
+                  {% if t.count > 0 %}<span class="badge warn">{{ t.count }}</span>{% else %}<span class="badge neutral">0</span>{% endif %}
+                {% else %}
+                  <span class="muted">—</span>
+                {% endif %}
+              </td>
+              <td class="small">
+                {% if t.complete %}
+                  <span class="badge ok">已查全</span>
+                  {% if t.restarts %}<br><span class="muted">续页 410，已丢弃重扫 {{ t.restarts }} 次</span>{% endif %}
+                {% else %}
+                  <span class="badge danger">未查全</span>
+                  {% if t.error %}<br><span class="muted">{{ t.error }}</span>{% endif %}
+                {% endif %}
+              </td>
+              <td class="small">
+                {% for s in t.samples %}
+                  <div class="budget-line">
+                    <span class="mono">{{ s.name }}</span>
+                    <span class="muted">finalizers: {{ s.finalizers|join(', ') }}</span>
+                  </div>
+                {% else %}
+                  <span class="muted">无</span>
+                {% endfor %}
+                {% if t.finalizer_objects > t.samples|length %}
+                  <div class="muted">… 共 {{ t.finalizer_objects }} 个带 finalizer</div>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">未发现任何可列表的命名空间资源类型。</p>
+    {% endif %}
+  </section>
+{% endif %}
+{% endblock %}

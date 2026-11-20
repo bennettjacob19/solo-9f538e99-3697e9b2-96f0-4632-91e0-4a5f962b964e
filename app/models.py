@@ -116,6 +116,26 @@ class NodeInfo:
 
 
 @dataclass
+class NamespaceInfo:
+    """The namespace object itself, as read at a point in time.
+
+    The UID is the identity: a namespace that is deleted and re-created under
+    the same name is a different object, and any scan that spanned the swap
+    must be discarded.
+    """
+
+    name: str
+    uid: str
+    phase: str = ""
+    deletion_timestamp: str | None = None
+    finalizers: list[str] = field(default_factory=list)
+
+    @property
+    def terminating(self) -> bool:
+        return self.phase == "Terminating" or self.deletion_timestamp is not None
+
+
+@dataclass
 class PodStatus:
     """Live status of one Pod object (identified by UID) in a drain round."""
 

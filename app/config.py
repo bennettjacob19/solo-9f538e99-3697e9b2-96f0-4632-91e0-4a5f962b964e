@@ -22,6 +22,10 @@ Environment variables (all optional):
     Path to a CA bundle for ``host`` mode.
 ``DRAIN_KUBECONFIG`` / ``DRAIN_KUBE_CONTEXT``
     For ``kubeconfig`` mode.
+``DRAIN_SCAN_PAGE_SIZE``
+    Page size for namespace residue scans (default 500).  The rehearsal
+    compose file sets it small so pagination and continue-token expiry can
+    be exercised with a handful of objects.
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ class Settings:
     kubeconfig: str | None
     context: str | None
     title: str = "节点排空值班台"
+    scan_page_size: int = 500
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -60,6 +65,10 @@ class Settings:
             path = Path(token_file)
             if path.exists():
                 token = path.read_text().strip()
+        try:
+            page_size = int(os.environ.get("DRAIN_SCAN_PAGE_SIZE", "500"))
+        except ValueError:
+            page_size = 500
         return cls(
             mode=mode,
             host=os.environ.get("DRAIN_KUBE_HOST"),
@@ -69,6 +78,7 @@ class Settings:
             kubeconfig=os.environ.get("DRAIN_KUBECONFIG") or os.environ.get("KUBECONFIG"),
             context=os.environ.get("DRAIN_KUBE_CONTEXT"),
             title=os.environ.get("DRAIN_TITLE", "节点排空值班台"),
+            scan_page_size=max(1, page_size),
         )
 
 

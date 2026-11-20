@@ -10,13 +10,25 @@ where the exercise depends on them:
   ``policy/v1`` Eviction subresource, including the UID precondition.
 * ``GET /apis/policy/v1/poddisruptionbudgets`` with live budget accounting.
 
+It also implements just enough of the discovery + paginated list surface for
+the namespace residue scanner:
+
+* ``GET /api/v1``, ``GET /apis``, ``GET /apis/{group}/{version}`` discovery
+  documents (including a subresource, a cluster-scoped type, a type without
+  ``list``, and a group served at two versions).
+* ``GET .../namespaces/{ns}/{resource}?limit=&continue=`` with continue
+  tokens that can be expired on demand (HTTP 410).
+* ``GET /api/v1/namespaces/{name}`` so a scan can pin the namespace UID.
+
 Eviction decisions are made under one lock against freshly computed budget
 status, so two nodes drained concurrently cannot jointly exceed a shared
 PodDisruptionBudget.
 
 The ``/api/sim`` endpoints and the page at ``/`` let an operator change a
 budget, replace a pod under the same name (new UID), make a replacement ready,
-or let an evicted pod finish terminating.
+let an evicted pod finish terminating, and arm the two scan drills: removing
+the first page of a list while expiring its continue token, and failing one
+API group's discovery.
 """
 
 from __future__ import annotations
@@ -28,7 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
@@ -59,6 +71,7 @@ class SimPod:
     phase: str = "Running"
     terminating: bool = False
     deletion_timestamp: str | None = None
+    finalizers: list[str] = field(default_factory=list)
     resource_version: int = 1
 
     @property
@@ -77,6 +90,7 @@ class SimPDB:
     selector: dict[str, str]
     min_available: int | None = None
     max_unavailable: int | None = None
+    finalizers: list[str] = field(default_factory=list)
     generation: int = 1
     resource_version: int = 1
 
@@ -110,13 +124,103 @@ class SimNode:
     resource_version: int = 1
 
 
+@dataclass
+class SimNamespace:
+    name: str
+    uid: str = field(default_factory=_new_uid)
+    phase: str = "Active"
+    deletion_timestamp: str | None = None
+    finalizers: list[str] = field(default_factory=list)
+    resource_version: int = 1
+
+
+@dataclass
+class SimObject:
+    """A generic namespaced object (ConfigMap, Rollout, ...) for scan drills."""
+
+    group: str  # "" 表示核心组
+    resource: str  # 复数名，如 configmaps
+    namespace: str
+    name: str
+    kind: str
+    api_version: str
+    uid: str = field(default_factory=_new_uid)
+    finalizers: list[str] = field(default_factory=list)
+    resource_version: int = 1
+
+    @property
+    def key(self) -> tuple[str, str, str, str]:
+        return (self.group, self.resource, self.namespace, self.name)
+
+
+#: Generic resource types the simulator can store and serve, and the
+#: apiVersion/kind they are serialised with.  Versions are views over the
+#: same objects, like a real API server.
+GENERIC_KINDS: dict[tuple[str, str], tuple[str, str]] = {
+    ("", "configmaps"): ("v1", "ConfigMap"),
+    ("", "secrets"): ("v1", "Secret"),
+    ("workloads.example.io", "rollouts"): ("workloads.example.io/v1", "Rollout"),
+    ("workloads.example.io", "experiments"): ("workloads.example.io/v1alpha1", "Experiment"),
+}
+
+_LIST_VERBS = ["create", "delete", "get", "list", "patch", "update", "watch"]
+
+#: Discovery documents.  Deliberately includes a subresource, a type without
+#: the list verb, cluster-scoped types, and a group at two versions, so the
+#: scanner's filtering rules are all exercised.
+CORE_RESOURCES: list[dict[str, Any]] = [
+    {"name": "pods", "namespaced": True, "kind": "Pod", "verbs": _LIST_VERBS},
+    {"name": "pods/eviction", "namespaced": True, "kind": "Eviction", "verbs": ["create"]},
+    {"name": "pods/status", "namespaced": True, "kind": "Pod", "verbs": ["get", "patch", "update"]},
+    {"name": "configmaps", "namespaced": True, "kind": "ConfigMap", "verbs": _LIST_VERBS},
+    {"name": "secrets", "namespaced": True, "kind": "Secret", "verbs": _LIST_VERBS},
+    {"name": "bindings", "namespaced": True, "kind": "Binding", "verbs": ["create"]},
+    {"name": "namespaces", "namespaced": False, "kind": "Namespace", "verbs": _LIST_VERBS},
+    {"name": "nodes", "namespaced": False, "kind": "Node", "verbs": ["get", "list", "patch", "watch"]},
+]
+
+GROUP_VERSIONS: dict[str, dict[str, Any]] = {
+    "policy": {
+        "versions": ["v1"],
+        "preferred": "v1",
+        "resources": {
+            "v1": [
+                {"name": "poddisruptionbudgets", "namespaced": True, "kind": "PodDisruptionBudget", "verbs": _LIST_VERBS},
+                {"name": "poddisruptionbudgets/status", "namespaced": True, "kind": "PodDisruptionBudget", "verbs": ["get", "patch", "update"]},
+            ],
+        },
+    },
+    "workloads.example.io": {
+        "versions": ["v1", "v1alpha1"],
+        "preferred": "v1",
+        "resources": {
+            "v1": [
+                {"name": "rollouts", "namespaced": True, "kind": "Rollout", "verbs": _LIST_VERBS},
+            ],
+            "v1alpha1": [
+                {"name": "rollouts", "namespaced": True, "kind": "Rollout", "verbs": _LIST_VERBS},
+                {"name": "experiments", "namespaced": True, "kind": "Experiment", "verbs": _LIST_VERBS},
+            ],
+        },
+    },
+}
+
+
 class ClusterState:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.nodes: dict[str, SimNode] = {}
         self.pods: dict[tuple[str, str], SimPod] = {}
         self.pdbs: dict[tuple[str, str], SimPDB] = {}
+        self.namespaces: dict[str, SimNamespace] = {}
+        self.objects: dict[tuple[str, str, str, str], SimObject] = {}
         self.events: list[dict[str, Any]] = []
+        # Continue tokens embed this epoch; bumping it expires every token.
+        self.page_epoch = 1
+        # One-shot drill: remove the first page of this list and expire tokens.
+        self.drill_vanish: dict[str, str] | None = None
+        # Groups whose discovery document should fail.
+        self.failing_groups: set[str] = set()
         self.reset()
 
     # -- seed --------------------------------------------------------------
@@ -125,7 +229,23 @@ class ClusterState:
             self.nodes = {name: SimNode(name=name) for name in NODE_NAMES}
             self.pods = {}
             self.pdbs = {}
+            self.namespaces = {}
+            self.objects = {}
             self.events = []
+            self.page_epoch += 1
+            self.drill_vanish = None
+            self.failing_groups = set()
+
+            for name in ("default", "shop", "kube-system"):
+                self.namespaces[name] = SimNamespace(name=name)
+            # A namespace stuck in Terminating, with leftovers of several
+            # resource types — the scan drill's subject.
+            self.namespaces["stuck-ns"] = SimNamespace(
+                name="stuck-ns",
+                phase="Terminating",
+                deletion_timestamp="2026-01-01T00:10:00Z",
+                finalizers=["kubernetes"],
+            )
 
             def add(
                 namespace: str,
@@ -169,6 +289,57 @@ class ClusterState:
             self.pdbs[("shop", "cache-pdb")] = SimPDB(
                 name="cache-pdb", namespace="shop", selector={"app": "cache"}, min_available=1
             )
+
+            # -- residue inside the Terminating namespace -------------------
+            # Eight terminating pods, six of them held by a finalizer.  They
+            # sit on no node, so they never interfere with drain rounds.
+            for index in range(8):
+                pod = SimPod(
+                    namespace="stuck-ns",
+                    name=f"stuck-pod-{index}",
+                    node="",
+                    labels={"app": "stuck"},
+                    owner_kind="ReplicaSet",
+                    ready=False,
+                    phase="Pending",
+                    terminating=True,
+                    deletion_timestamp="2026-01-01T00:10:00Z",
+                    finalizers=["example.com/cleanup"] if index < 6 else [],
+                )
+                self.pods[pod.key] = pod
+            self.pdbs[("stuck-ns", "stuck-pdb")] = SimPDB(
+                name="stuck-pdb",
+                namespace="stuck-ns",
+                selector={"app": "stuck"},
+                min_available=1,
+                finalizers=["example.com/pdb-guard"],
+            )
+
+            def put(
+                group: str,
+                resource: str,
+                name: str,
+                finalizers: list[str] | None = None,
+            ) -> None:
+                api_version, kind = GENERIC_KINDS[(group, resource)]
+                obj = SimObject(
+                    group=group,
+                    resource=resource,
+                    namespace="stuck-ns",
+                    name=name,
+                    kind=kind,
+                    api_version=api_version,
+                    finalizers=list(finalizers or []),
+                )
+                self.objects[obj.key] = obj
+
+            put("", "configmaps", "stuck-cm-0", ["example.com/cleanup"])
+            put("", "configmaps", "stuck-cm-1")
+            put("", "configmaps", "stuck-cm-2")
+            put("workloads.example.io", "rollouts", "stuck-rollout-0", ["example.com/traffic-drain"])
+            put("workloads.example.io", "rollouts", "stuck-rollout-1")
+            put("workloads.example.io", "experiments", "stuck-exp-0", ["example.com/cleanup"])
+
             self._event("reset", "演练环境已恢复到初始状态")
 
     def _event(self, kind: str, message: str, **extra: Any) -> None:
@@ -215,6 +386,8 @@ class ClusterState:
         if pod.terminating and pod.deletion_timestamp:
             metadata["deletionTimestamp"] = pod.deletion_timestamp
             metadata["deletionGracePeriodSeconds"] = 30
+        if pod.finalizers:
+            metadata["finalizers"] = list(pod.finalizers)
         if pod.owner_kind:
             metadata["ownerReferences"] = [
                 {
@@ -269,17 +442,20 @@ class ClusterState:
             spec["minAvailable"] = pdb.min_available
         else:
             spec["maxUnavailable"] = pdb.max_unavailable or 0
+        metadata: dict[str, Any] = {
+            "name": pdb.name,
+            "namespace": pdb.namespace,
+            "uid": f"pdb-{pdb.namespace}-{pdb.name}",
+            "generation": pdb.generation,
+            "resourceVersion": str(pdb.resource_version),
+            "creationTimestamp": "2026-01-01T00:00:00Z",
+        }
+        if pdb.finalizers:
+            metadata["finalizers"] = list(pdb.finalizers)
         return {
             "apiVersion": "policy/v1",
             "kind": "PodDisruptionBudget",
-            "metadata": {
-                "name": pdb.name,
-                "namespace": pdb.namespace,
-                "uid": f"pdb-{pdb.namespace}-{pdb.name}",
-                "generation": pdb.generation,
-                "resourceVersion": str(pdb.resource_version),
-                "creationTimestamp": "2026-01-01T00:00:00Z",
-            },
+            "metadata": metadata,
             "spec": spec,
             "status": {
                 "observedGeneration": pdb.generation,
@@ -287,6 +463,84 @@ class ClusterState:
                 "disruptionsAllowed": status["disruptionsAllowed"],
             },
         }
+
+    def namespace_json(self, ns: SimNamespace) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "name": ns.name,
+            "uid": ns.uid,
+            "resourceVersion": str(ns.resource_version),
+            "creationTimestamp": "2026-01-01T00:00:00Z",
+        }
+        if ns.deletion_timestamp:
+            metadata["deletionTimestamp"] = ns.deletion_timestamp
+        if ns.finalizers:
+            metadata["finalizers"] = list(ns.finalizers)
+        return {
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": metadata,
+            "spec": {"finalizers": list(ns.finalizers)},
+            "status": {"phase": ns.phase},
+        }
+
+    def object_json(self, obj: SimObject) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "name": obj.name,
+            "namespace": obj.namespace,
+            "uid": obj.uid,
+            "resourceVersion": str(obj.resource_version),
+            "creationTimestamp": "2026-01-01T00:00:00Z",
+        }
+        if obj.finalizers:
+            metadata["finalizers"] = list(obj.finalizers)
+        return {
+            "apiVersion": obj.api_version,
+            "kind": obj.kind,
+            "metadata": metadata,
+            "spec": {},
+        }
+
+    # -- pagination ----------------------------------------------------------
+    def paginate(
+        self, items: list[dict[str, Any]], limit: int | None, token: str | None
+    ) -> tuple[list[dict[str, Any]], str | None] | None:
+        """Slice one page out of a sorted listing.
+
+        Returns ``None`` when the continue token is stale (the caller then
+        answers 410).  Tokens embed the page epoch, so any drill that bumps
+        the epoch expires every outstanding token at once.
+        """
+        offset = 0
+        if token:
+            parts = token.split(":")
+            if len(parts) != 3 or parts[0] != "sim" or parts[1] != str(self.page_epoch):
+                return None
+            try:
+                offset = int(parts[2])
+            except ValueError:
+                return None
+        if limit and limit > 0:
+            page = items[offset : offset + limit]
+            nxt = offset + limit
+            next_token = f"sim:{self.page_epoch}:{nxt}" if nxt < len(items) else None
+        else:
+            page, next_token = items[offset:], None
+        return page, next_token
+
+    def delete_listed(
+        self, group: str, resource: str, namespace: str, page: list[dict[str, Any]]
+    ) -> None:
+        """Remove the just-listed objects, for the vanish-after-first-page drill."""
+        for item in page:
+            name = (item.get("metadata") or {}).get("name")
+            if not name:
+                continue
+            if group == "" and resource == "pods":
+                self.pods.pop((namespace, name), None)
+            elif group == "policy" and resource == "poddisruptionbudgets":
+                self.pdbs.pop((namespace, name), None)
+            else:
+                self.objects.pop((group, resource, namespace, name), None)
 
 
 STATE = ClusterState()
@@ -338,6 +592,184 @@ def _eviction_precondition_uid(body: dict[str, Any]) -> str | None:
     options = body.get("deleteOptions") or {}
     preconditions = options.get("preconditions") or {}
     return preconditions.get("uid")
+
+
+# -- discovery ---------------------------------------------------------------
+@app.get("/api/v1")
+def core_api_resources() -> dict[str, Any]:
+    return {
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "v1",
+        "resources": CORE_RESOURCES,
+    }
+
+
+@app.get("/apis")
+def api_groups() -> dict[str, Any]:
+    groups = []
+    for name, doc in GROUP_VERSIONS.items():
+        groups.append(
+            {
+                "name": name,
+                "versions": [
+                    {"groupVersion": f"{name}/{v}", "version": v} for v in doc["versions"]
+                ],
+                "preferredVersion": {
+                    "groupVersion": f"{name}/{doc['preferred']}",
+                    "version": doc["preferred"],
+                },
+            }
+        )
+    return {"kind": "APIGroupList", "apiVersion": "v1", "groups": groups}
+
+
+@app.get("/apis/{group}/{version}")
+def group_api_resources(group: str, version: str) -> Response:
+    doc = GROUP_VERSIONS.get(group)
+    if doc is None or version not in doc["versions"]:
+        return status_response(
+            404, "NotFound", f"the server could not find the requested resource"
+        )
+    with STATE.lock:
+        failing = group in STATE.failing_groups
+    if failing:
+        return status_response(
+            500, "InternalError", f"discovery for group {group} is unavailable"
+        )
+    return JSONResponse(
+        {
+            "kind": "APIResourceList",
+            "apiVersion": "v1",
+            "groupVersion": f"{group}/{version}",
+            "resources": doc["resources"][version],
+        }
+    )
+
+
+# -- namespaces ---------------------------------------------------------------
+@app.get("/api/v1/namespaces/{name}")
+def read_namespace(name: str) -> Response:
+    with STATE.lock:
+        ns = STATE.namespaces.get(name)
+        if ns is None:
+            return status_response(404, "NotFound", f'namespaces "{name}" not found')
+        return JSONResponse(STATE.namespace_json(ns))
+
+
+# -- generic paginated namespaced lists ---------------------------------------
+def _namespaced_listing(
+    group: str,
+    version: str,
+    resource: str,
+    namespace: str,
+    limit: int | None,
+    token: str | None,
+) -> Response:
+    with STATE.lock:
+        if group == "" and version == "v1" and resource == "pods":
+            kind = "Pod"
+            items = [
+                STATE.pod_json(pod)
+                for pod in STATE.pods.values()
+                if pod.namespace == namespace
+            ]
+        elif group == "policy" and version == "v1" and resource == "poddisruptionbudgets":
+            kind = "PodDisruptionBudget"
+            items = [
+                STATE.pdb_json(pdb)
+                for pdb in STATE.pdbs.values()
+                if pdb.namespace == namespace
+            ]
+        elif (group, resource) in GENERIC_KINDS:
+            doc = GROUP_VERSIONS.get(group) if group else None
+            if group:
+                advertised = (doc or {}).get("resources", {}).get(version)
+                if advertised is None or resource not in {r["name"] for r in advertised}:
+                    return status_response(
+                        404, "NotFound", "the server could not find the requested resource"
+                    )
+            elif version != "v1":
+                return status_response(
+                    404, "NotFound", "the server could not find the requested resource"
+                )
+            kind = GENERIC_KINDS[(group, resource)][1]
+            items = [
+                STATE.object_json(obj)
+                for obj in STATE.objects.values()
+                if obj.group == group
+                and obj.resource == resource
+                and obj.namespace == namespace
+            ]
+        else:
+            return status_response(
+                404, "NotFound", "the server could not find the requested resource"
+            )
+        api_version = f"{group}/{version}" if group else version
+        for item in items:
+            item["apiVersion"] = api_version
+        items.sort(key=lambda item: item["metadata"]["name"])
+
+        result = STATE.paginate(items, limit, token)
+        if result is None:
+            return status_response(
+                410,
+                "Expired",
+                "continue token expired; relist to obtain a fresh snapshot",
+            )
+        page, next_token = result
+
+        # One-shot drill: the first page of this list goes out, then its
+        # objects vanish and every continue token (including this one) dies.
+        if (
+            STATE.drill_vanish
+            and not token
+            and next_token
+            and STATE.drill_vanish.get("group") == group
+            and STATE.drill_vanish.get("resource") == resource
+        ):
+            STATE.delete_listed(group, resource, namespace, page)
+            STATE.page_epoch += 1
+            STATE.drill_vanish = None
+            STATE._event(
+                "drill",
+                f"预设触发：{group or 'core'}/{resource} 第一页 {len(page)} 个对象已移除，"
+                "续页令牌已过期（410）",
+            )
+
+        metadata: dict[str, Any] = {"resourceVersion": "1"}
+        if next_token:
+            metadata["continue"] = next_token
+        return JSONResponse(
+            {
+                "apiVersion": api_version,
+                "kind": f"{kind}List",
+                "metadata": metadata,
+                "items": page,
+            }
+        )
+
+
+@app.get("/api/v1/namespaces/{namespace}/{resource}")
+def list_core_namespaced(
+    namespace: str,
+    resource: str,
+    limit: int | None = None,
+    continue_: str | None = Query(default=None, alias="continue"),
+) -> Response:
+    return _namespaced_listing("", "v1", resource, namespace, limit, continue_)
+
+
+@app.get("/apis/{group}/{version}/namespaces/{namespace}/{resource}")
+def list_group_namespaced(
+    group: str,
+    version: str,
+    namespace: str,
+    resource: str,
+    limit: int | None = None,
+    continue_: str | None = Query(default=None, alias="continue"),
+) -> Response:
+    return _namespaced_listing(group, version, resource, namespace, limit, continue_)
 
 
 # -- Kubernetes API surface ------------------------------------------------
@@ -506,20 +938,6 @@ def list_pdbs() -> dict[str, Any]:
     }
 
 
-@app.get("/apis/policy/v1/namespaces/{namespace}/poddisruptionbudgets")
-def list_pdbs_in_namespace(namespace: str) -> dict[str, Any]:
-    with STATE.lock:
-        items = [
-            STATE.pdb_json(pdb) for pdb in STATE.pdbs.values() if pdb.namespace == namespace
-        ]
-    return {
-        "apiVersion": "policy/v1",
-        "kind": "PodDisruptionBudgetList",
-        "metadata": {"resourceVersion": "1"},
-        "items": items,
-    }
-
-
 @app.get("/apis/policy/v1/namespaces/{namespace}/poddisruptionbudgets/{name}")
 def read_pdb(namespace: str, name: str) -> Response:
     with STATE.lock:
@@ -548,6 +966,33 @@ def sim_state() -> dict[str, Any]:
                 }
                 for node in sorted(STATE.nodes.values(), key=lambda n: n.name)
             ],
+            "namespaces": [
+                {
+                    "name": ns.name,
+                    "uid": ns.uid,
+                    "phase": ns.phase,
+                    "finalizers": ns.finalizers,
+                }
+                for ns in sorted(STATE.namespaces.values(), key=lambda n: n.name)
+            ],
+            "objects": [
+                {
+                    "group": obj.group,
+                    "resource": obj.resource,
+                    "namespace": obj.namespace,
+                    "name": obj.name,
+                    "kind": obj.kind,
+                    "finalizers": obj.finalizers,
+                }
+                for obj in sorted(
+                    STATE.objects.values(),
+                    key=lambda o: (o.group, o.resource, o.namespace, o.name),
+                )
+            ],
+            "drills": {
+                "vanish_after_first_page": STATE.drill_vanish,
+                "failing_groups": sorted(STATE.failing_groups),
+            },
             "pods": [
                 {
                     "namespace": pod.namespace,
@@ -696,6 +1141,7 @@ async def create_pod(request: Request) -> Response:
             phase=str(body.get("phase") or "Running"),
         )
         STATE.pods[pod.key] = pod
+        STATE.namespaces.setdefault(namespace, SimNamespace(name=namespace))
         STATE._event("create", f"创建 Pod {namespace}/{name} 于 {node}")
         return JSONResponse(STATE.pod_json(pod), status_code=201)
 
@@ -743,6 +1189,114 @@ def finish_all_terminating() -> dict[str, Any]:
         if finished:
             STATE._event("exit", f"{len(finished)} 个待退出 Pod 已退出")
         return {"exited": finished}
+
+
+@app.post("/api/sim/drills/vanish-after-first-page")
+async def arm_vanish_drill(request: Request) -> Response:
+    """One-shot: the next first page of this list loses its objects and its
+    continue token expires (the follow-up page gets a 410)."""
+    body = await request.json()
+    group = str(body.get("group") or "")
+    resource = str(body.get("resource") or "")
+    if not resource:
+        return status_response(422, "Invalid", "需要 resource")
+    with STATE.lock:
+        STATE.drill_vanish = {"group": group, "resource": resource}
+        STATE._event(
+            "drill",
+            f"已预设：{group or 'core'}/{resource} 第一页返回后移除页内对象并让续页过期（一次性）",
+        )
+        return JSONResponse({"armed": True, "group": group, "resource": resource})
+
+
+@app.post("/api/sim/drills/discovery-failure")
+async def arm_discovery_failure(request: Request) -> Response:
+    """Make one API group's discovery document fail until cleared."""
+    body = await request.json()
+    group = str(body.get("group") or "")
+    if not group:
+        return status_response(422, "Invalid", "需要 group")
+    if group not in GROUP_VERSIONS:
+        return status_response(404, "NotFound", f"未知 API 组 {group}")
+    with STATE.lock:
+        STATE.failing_groups.add(group)
+        STATE._event("drill", f"已预设：API 组 {group} 的发现将失败")
+        return JSONResponse({"armed": True, "group": group})
+
+
+@app.post("/api/sim/drills/clear")
+def clear_drills() -> dict[str, bool]:
+    with STATE.lock:
+        STATE.drill_vanish = None
+        STATE.failing_groups.clear()
+        STATE._event("drill", "已清除所有扫描演练预设")
+    return {"cleared": True}
+
+
+@app.post("/api/sim/namespaces/{name}/remove")
+def remove_namespace(name: str) -> Response:
+    with STATE.lock:
+        if name not in STATE.namespaces:
+            return status_response(404, "NotFound", f'namespaces "{name}" not found')
+        del STATE.namespaces[name]
+        STATE._event("namespace", f"命名空间 {name} 已删除")
+        return JSONResponse({"removed": name})
+
+
+@app.post("/api/sim/namespaces/{name}/recreate")
+def recreate_namespace(name: str) -> Response:
+    """Delete and re-create the namespace under the same name (new UID)."""
+    with STATE.lock:
+        old = STATE.namespaces.get(name)
+        STATE.namespaces[name] = SimNamespace(name=name)
+        # A re-created namespace starts empty; sweep the leftovers.
+        STATE.pods = {k: v for k, v in STATE.pods.items() if k[0] != name}
+        STATE.pdbs = {k: v for k, v in STATE.pdbs.items() if k[0] != name}
+        STATE.objects = {k: v for k, v in STATE.objects.items() if k[2] != name}
+        new = STATE.namespaces[name]
+        STATE._event(
+            "namespace",
+            f"命名空间 {name} 同名重建："
+            + (f"UID {old.uid[:8]} → " if old else "（此前不存在）")
+            + f"{new.uid[:8]}，残留已清空",
+        )
+        return JSONResponse({"recreated": name, "uid": new.uid})
+
+
+@app.post("/api/sim/objects")
+async def create_object(request: Request) -> Response:
+    """Add a generic namespaced object (rehearsal convenience)."""
+    body = await request.json()
+    group = str(body.get("group") or "")
+    resource = str(body.get("resource") or "")
+    namespace = str(body.get("namespace") or "")
+    name = str(body.get("name") or "")
+    finalizers = [str(f) for f in (body.get("finalizers") or []) if str(f)]
+    if (group, resource) not in GENERIC_KINDS:
+        return status_response(422, "Invalid", f"未知的资源类型 {group}/{resource}")
+    if not namespace or not name:
+        return status_response(422, "Invalid", "需要 namespace 与 name")
+    with STATE.lock:
+        api_version, kind = GENERIC_KINDS[(group, resource)]
+        obj = SimObject(
+            group=group,
+            resource=resource,
+            namespace=namespace,
+            name=name,
+            kind=kind,
+            api_version=api_version,
+            finalizers=finalizers,
+        )
+        if obj.key in STATE.objects:
+            return status_response(409, "AlreadyExists", f"{resource} \"{name}\" already exists")
+        STATE.objects[obj.key] = obj
+        STATE.namespaces.setdefault(namespace, SimNamespace(name=namespace))
+        STATE._event(
+            "create",
+            f"创建对象 {group or 'core'}/{resource} {namespace}/{name}"
+            + (f"（finalizers: {', '.join(finalizers)}）" if finalizers else ""),
+        )
+        return JSONResponse(STATE.object_json(obj), status_code=201)
 
 
 @app.post("/api/sim/reset")

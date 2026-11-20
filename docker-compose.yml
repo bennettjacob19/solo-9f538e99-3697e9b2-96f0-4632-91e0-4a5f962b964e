@@ -28,5 +28,7 @@ services:
       DRAIN_KUBE_INSECURE: "1"
       DRAIN_SIM_URL: http://localhost:8080
       DRAIN_TITLE: 节点排空值班台（演练）
+      # 演练端对象很少；把扫描页大小调小以演示分页与续页 410 重扫。
+      DRAIN_SCAN_PAGE_SIZE: "5"
     ports:
       - "8000:8000"
